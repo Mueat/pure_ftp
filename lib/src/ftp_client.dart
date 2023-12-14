@@ -9,6 +9,8 @@ import 'package:pure_ftp/src/file_system/ftp_file_system.dart';
 import 'package:pure_ftp/src/ftp/ftp_socket.dart';
 import 'package:pure_ftp/src/ftp/ftp_task.dart';
 import 'package:pure_ftp/src/task_manager_mixin.dart';
+import 'package:pure_ftp/src/ftp/ftp_commands.dart';
+import 'package:pure_ftp/src/ftp/extensions/ftp_command_extension.dart';
 
 typedef LogCallback = void Function(dynamic message);
 
@@ -48,6 +50,18 @@ class FtpClient with TaskManagerMixin {
 
   FtpSocket get socket => _socket;
 
+  Future<bool> isConnected() async {
+    if (!_isConnected) return false;
+    try {
+      var res = await FtpCommand.NOOP
+          .writeAndRead(socket)
+          .timeout(Duration(seconds: 3));
+      return res.code == 200;
+    } on TimeoutException {
+      return false;
+    }
+  }
+
   /// Connects to the FTP server.
   /// And initializes the file system.
   Future<void> connect() async {
@@ -57,8 +71,8 @@ class FtpClient with TaskManagerMixin {
   }
 
   /// Disconnects from the FTP server.
-  Future<void> disconnect() async {
-    await _socket.disconnect();
+  Future<void> disconnect({bool safe = true}) async {
+    await _socket.disconnect(safe: safe);
     _isConnected = false;
   }
 

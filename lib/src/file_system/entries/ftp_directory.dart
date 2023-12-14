@@ -1,5 +1,6 @@
 import 'package:pure_ftp/src/extensions/ftp_directory_extensions.dart';
 import 'package:pure_ftp/src/file_system/ftp_entry.dart';
+import 'package:pure_ftp/src/file_system/ftp_entry_info.dart';
 import 'package:pure_ftp/src/ftp/exceptions/ftp_exception.dart';
 import 'package:pure_ftp/src/ftp/extensions/ftp_command_extension.dart';
 import 'package:pure_ftp/src/ftp/ftp_commands.dart';
@@ -11,6 +12,7 @@ class FtpDirectory extends FtpEntry {
   const FtpDirectory({
     required super.path,
     required super.client,
+    super.info,
   }) : _client = client;
 
   @override
@@ -32,21 +34,73 @@ class FtpDirectory extends FtpEntry {
   @override
   Future<bool> exists() async {
     final response = await FtpCommand.CWD.writeAndRead(_client.socket, [path]);
-    await FtpCommand.CWD
+    if (path != _client.currentDirectory.path) {
+      await FtpCommand.CWD
+          .writeAndRead(_client.socket, [_client.currentDirectory.path]);
+    }
+    return response.isSuccessful;
+  }
+
+  Future<bool> cwd() async {
+    final response = await FtpCommand.CWD.writeAndRead(_client.socket, [path]);
+    return response.isSuccessful;
+  }
+
+  Future<bool> cwdCurrent() async {
+    final response = await FtpCommand.CWD
         .writeAndRead(_client.socket, [_client.currentDirectory.path]);
     return response.isSuccessful;
   }
 
   @override
   Future<bool> create({bool recursive = false}) async {
+    var ret = await mkDirAll();
+    await cwdCurrent();
+    return ret;
+  }
+
+  Future<bool> mkDirAll() async {
+    if (await cwd()) {
+      return true;
+    }
+
+    var pret = await parent.mkDirAll();
+    if (!pret) {
+      return pret;
+    }
+
     final response = await FtpCommand.MKD.writeAndRead(_client.socket, [path]);
-    return response.isSuccessful || response.code == 550;
+    return response.isSuccessful;
   }
 
   @override
   Future<bool> delete({bool recursive = false}) async {
     if (!await exists()) {
       return true;
+    }
+    if (recursive) {
+      // final resp = await FtpCommand.RMDA.writeAndRead(_client.socket, [path]);
+      // if (resp.isSuccessful) {
+      //   return true;
+      // }
+      final children = await list();
+      for (var f in children) {
+        final resp = await f.delete(recursive: true);
+        if (!resp) {
+          return false;
+        }
+      }
+
+      final hideChildren = await _client.fs.listDirectory(
+          directory: this.getChildDir(".*"), realDirectory: this);
+      for (var f in hideChildren) {
+        if (f.name != "." && f.name != "..") {
+          final resp = await f.delete(recursive: true);
+          if (!resp) {
+            return false;
+          }
+        }
+      }
     }
     final response = await FtpCommand.RMD.writeAndRead(_client.socket, [path]);
     //todo remove recursive if is not empty
@@ -134,9 +188,10 @@ class FtpDirectory extends FtpEntry {
 
   Future<List<String>> listNames() => _client.fs.listDirectoryNames(this);
 
-  FtpDirectory copyWith(String path) {
+  FtpDirectory copyWith(String path, {FtpEntryInfo? info}) {
     return FtpDirectory(
       path: path,
+      info: info,
       client: _client,
     );
   }

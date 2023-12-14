@@ -1,7 +1,9 @@
 // ignore_for_file: constant_identifier_names
 
 import 'dart:async';
+import 'dart:convert';
 
+import 'package:pure_ftp/pure_ftp.dart';
 import 'package:pure_ftp/src/file_system/entries/ftp_directory.dart';
 import 'package:pure_ftp/src/file_system/entries/ftp_file.dart';
 import 'package:pure_ftp/src/file_system/entries/ftp_link.dart';
@@ -51,7 +53,7 @@ class FtpFileSystem {
   FtpDirectory get currentDirectory => _currentDirectory;
 
   FtpDirectory get rootDirectory => FtpDirectory(
-    path: _rootPath,
+        path: _rootPath,
         client: _client,
       );
 
@@ -117,6 +119,7 @@ class FtpFileSystem {
   Future<List<FtpEntry>> listDirectory({
     FtpDirectory? directory,
     ListType? override,
+    FtpDirectory? realDirectory,
   }) async {
     final listType = override ?? this.listType;
     final dir = directory ?? _currentDirectory;
@@ -125,38 +128,38 @@ class FtpFileSystem {
       listType.command.write(_client.socket, [dir.path]);
       //will be closed by the transfer channel
       // ignore: close_sinks
-      final socket = await socketFuture;
-      final response = await _client.socket.read();
+      final socket = await socketFuture();
+      final response = await _client.socket.readAll();
+      if (response.isEmpty) {
+        throw FtpException('Error while listing directory');
+      }
 
       // wait 125 || 150 and >200 that indicates the end of the transfer
-      final bool transferCompleted = response.isSuccessfulForDataTransfer;
+      final bool transferCompleted = response[0].isSuccessfulForDataTransfer;
       if (!transferCompleted) {
-        if (response.code == 500 && listType == ListType.MLSD) {
+        if (response[0].code == 500 && listType == ListType.MLSD) {
           throw FtpException('MLSD command not supported by server');
         }
         throw FtpException('Error while listing directory');
       }
       final List<int> data = [];
       await socket.listen(data.addAll).asFuture();
-      final listData = String.fromCharCodes(data);
+      final listData = utf8.decode(data, allowMalformed: true);
       log?.call(listData);
-      final parseListDirResponse =
-          DataParserUtils.parseListDirResponse(listData, listType, dir);
-      var mainPath = dir.path;
+      final parseListDirResponse = DataParserUtils.parseListDirResponse(
+          listData, listType, realDirectory ?? dir);
+      var mainPath = realDirectory?.path ?? dir.path;
       if (mainPath.endsWith('/')) {
         mainPath = mainPath.substring(0, mainPath.length - 1);
       }
       final remappedEntries = parseListDirResponse.map((e, v) {
         if (e is FtpDirectory) {
-          return MapEntry(e.copyWith('${mainPath}/${e.name}'), v);
+          return MapEntry(e.copyWith('${mainPath}/${e.name}', info: v), v);
         } else if (e is FtpFile) {
-          return MapEntry(e.copyWith('${mainPath}/${e.name}'), v);
+          return MapEntry(e.copyWith('${mainPath}/${e.name}', info: v), v);
         } else if (e is FtpLink) {
           return MapEntry(
-              e.copyWith(
-                '${mainPath}/${e.name}',
-                e.linkTargetPath,
-              ),
+              e.copyWith('${mainPath}/${e.name}', e.linkTargetPath, info: v),
               v);
         } else {
           throw FtpException('Unknown type');
@@ -164,6 +167,9 @@ class FtpFileSystem {
       });
       _dirInfoCache
           .add(MapEntry(mainPath, remappedEntries.entries.whereType()));
+      if (response.length <= 1) {
+        await _client.socket.read();
+      }
       return remappedEntries.keys.toList();
     });
     return result;
@@ -176,20 +182,23 @@ class FtpFileSystem {
           _client.socket,
           [directory?.path ?? _currentDirectory.path],
         );
-        //will be closed by the transfer channel
-        // ignore: close_sinks
-        final socket = await socketFuture;
-        final response = await _client.socket.read();
-
-        // wait 125 || 150 and >200 that indicates the end of the transfer
-        final bool transferCompleted = response.isSuccessfulForDataTransfer;
+        final response = await _client.socket.readAll();
+        final bool transferCompleted = response[0].isSuccessfulForDataTransfer;
         if (!transferCompleted) {
           throw FtpException('Error while listing directory names');
         }
+
+        //will be closed by the transfer channel
+        // ignore: close_sinks
+        final socket = await socketFuture();
+
         final List<int> data = [];
         await socket.listen(data.addAll).asFuture();
-        final listData = String.fromCharCodes(data);
+        final listData = utf8.decode(data, allowMalformed: true);
         log?.call(listData);
+        if (response.length <= 1) {
+          await _client.socket.read();
+        }
         return listData
             .split('\n')
             .map((e) => e.trim())
@@ -197,21 +206,36 @@ class FtpFileSystem {
             .toList();
       });
 
-  Stream<List<int>> downloadFileStream(FtpFile file) =>
-      _transfer.downloadFileStream(file);
+  Stream<List<int>> downloadFileStream(FtpFile file,
+          {void Function(int s)? onProcess,
+          FtpSocketCancelToken? cancelToken,
+          int restSize = 0,
+          int speed = 0}) =>
+      _transfer.downloadFileStream(file,
+          onProcess: onProcess,
+          restSize: restSize,
+          speed: speed,
+          cancelToken: cancelToken);
 
-  Future<List<int>> downloadFile(FtpFile file) async {
+  Future<List<int>> downloadFile(FtpFile file,
+      {void Function(int s)? onProcess,
+      FtpSocketCancelToken? cancelToken}) async {
     final result = <int>[];
-    await downloadFileStream(file).listen(result.addAll).asFuture();
+    await downloadFileStream(file,
+            onProcess: onProcess, cancelToken: cancelToken)
+        .listen(result.addAll)
+        .asFuture();
     return result;
   }
 
   Future<bool> uploadFile(FtpFile file, List<int> data,
-      [UploadChunkSize chunkSize = UploadChunkSize.kb4]) async {
+      {UploadChunkSize chunkSize = UploadChunkSize.kb4,
+      void Function(int s)? onProcess}) async {
     final stream = StreamController<List<int>>();
     var result = false;
     try {
-      final future = uploadFileFromStream(file, stream.stream);
+      final future =
+          uploadFileFromStream(file, stream.stream, onProcess: onProcess);
       if (data.isEmpty) {
         stream.add(data);
       } else {
@@ -237,20 +261,37 @@ class FtpFileSystem {
       final cached =
           _dirInfoCache.firstWhereOrNull((e) => e.key == entry.parent.path);
       if (cached != null) {
-        return cached.value
-            .firstWhereOrNull((e) => e.key.name == entry.name)!
-            .value;
+        final r =
+            cached.value.firstWhereOrNull((e) => e.key.name == entry.name);
+        if (r != null) {
+          return r.value;
+        }
       }
     }
+    try {
+      if (entry is FtpFile) {
+        final lr = await listDirectory(
+            directory: FtpDirectory(path: entry.path, client: _client));
+        if (lr.isNotEmpty) {
+          return lr[0].info;
+        }
+      }
+    } catch (e) {
+      return null;
+    }
+
     //todo: finish it
     // final dir = entry.parent;
     // final entries = await listDirectory(directory: dir);
-    throw UnimplementedError();
+    return null;
   }
 
-  Future<bool> uploadFileFromStream(
-      FtpFile file, Stream<List<int>> stream) async {
-    return _transfer.uploadFileStream(file, stream);
+  Future<bool> uploadFileFromStream(FtpFile file, Stream<List<int>> stream,
+      {void Function(int s)? onProcess,
+      bool isAppend = false,
+      FtpSocketCancelToken? cancelToken}) async {
+    return _transfer.uploadFileStream(file, stream,
+        onProcess: onProcess, isAppend: isAppend, cancelToken: cancelToken);
   }
 
   FtpFileSystem copy() {

@@ -2,6 +2,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:meta/meta.dart';
@@ -17,7 +18,7 @@ import 'package:pure_ftp/src/socket/common/host_server.dart';
 import 'package:pure_ftp/src/socket/common/web_io_network_address.dart';
 
 typedef TransferChannelCallback<T> = FutureOr<T> Function(
-    FutureOr<ClientSocket> socketFuture, LogCallback? log);
+    FutureOr<ClientSocket> Function() socketFuture, LogCallback? log);
 typedef TransferFailCallback = FutureOr<void> Function(
     Object error, StackTrace stackTrace);
 
@@ -32,6 +33,7 @@ class FtpSocket {
   FtpTransferType _transferType;
 
   late ClientRawSocket _socket;
+  int? passivePort;
 
   FtpSocket({
     required FtpSocketInitOptions options,
@@ -122,7 +124,7 @@ class FtpSocket {
     _log?.call('Disconnecting from $_host:$_port');
     try {
       if (safe) {
-        await writeAndRead(FtpCommand.QUIT.toString());
+        write(FtpCommand.QUIT.toString());
       }
     } catch (_) {
       // ignore
@@ -133,17 +135,70 @@ class FtpSocket {
     }
   }
 
-  /// Fetch the response from the server
-  ///
-  /// FtpSocket.timeout is the time to wait for the response
-  Future<FtpResponse> read() async {
+  Future<List<String>> readLines() async {
     final res = StringBuffer();
     await Future.doWhile(() async {
-      if (_socket.available() > 0) {
+      bool dataReceivedSuccessfully = false;
+
+      //this is used to read all data for specific command line
+      while (_socket.available() > 0) {
         res.write(String.fromCharCodes(_socket.readMessage()!.toList()).trim());
+        dataReceivedSuccessfully = true;
+      }
+      if (dataReceivedSuccessfully) {
         return false;
       }
       await Future.delayed(const Duration(milliseconds: 300));
+
+      return true;
+    }).timeout(_timeout, onTimeout: () {
+      throw FtpException('Timeout reached for Receiving response!');
+    });
+    final result = res.toString().trimLeft();
+    if (result.length < 3) {
+      throw FtpException('Illegal Reply Exception');
+    }
+    final lines = result.split('\n');
+    if (lines.isNotEmpty && lines.last.length >= 4 && lines.last[3] == '-') {
+      return await readLines();
+    }
+    return lines;
+  }
+
+  Future<List<FtpResponse>> readAll({int? endCode}) async {
+    final lines = await readLines();
+    List<FtpResponse> ret = [];
+    for (var line in lines) {
+      _log?.call('[${DateTime.now().toString()}] $_host:$_port< $line');
+      if (line.length >= 3) {
+        var code = int.tryParse(line.substring(0, 3)) ?? -1;
+        ret.add(FtpResponse(code: code, message: line));
+      }
+    }
+    if (ret.isEmpty) {
+      throw FtpException("Read response failed");
+    }
+    return ret;
+  }
+
+  /// Fetch the response from the server
+  ///
+  /// FtpSocket.timeout is the time to wait for the response
+  Future<FtpResponse> read({int? endCode}) async {
+    final res = StringBuffer();
+    await Future.doWhile(() async {
+      bool dataReceivedSuccessfully = false;
+
+      //this is used to read all data for specific command line
+      while (_socket.available() > 0) {
+        res.write(String.fromCharCodes(_socket.readMessage()!.toList()).trim());
+        dataReceivedSuccessfully = true;
+      }
+      if (dataReceivedSuccessfully) {
+        return false;
+      }
+      await Future.delayed(const Duration(milliseconds: 300));
+
       return true;
     }).timeout(_timeout, onTimeout: () {
       throw FtpException('Timeout reached for Receiving response!');
@@ -167,10 +222,15 @@ class FtpSocket {
       }
     }
 
+    if (endCode != null && endCode != code) {
+      return await read();
+    }
+
     if (code == -1) {
       throw FtpException('Illegal Reply Exception');
     }
-    _log?.call('$_host:$_port< $result');
+
+    _log?.call('[${DateTime.now().toString()}] $_host:$_port< $result');
     return FtpResponse(code: code, message: result);
   }
 
@@ -183,7 +243,7 @@ class FtpSocket {
       _log?.call(
           '$_host:$_port> ${message.substring(0, 5)}${'*' * (message.length - 4)}');
     } else {
-      _log?.call('$_host:$_port> $message');
+      _log?.call('[${DateTime.now().toString()}] $_host:$_port> $message');
     }
   }
 
@@ -206,22 +266,58 @@ class FtpSocket {
     _transferType = type;
   }
 
+  Future<int> getPassivePort() async {
+    final passiveCommand = supportIPv6 ? FtpCommand.EPSV : FtpCommand.PASV;
+    final ftpResponse = await passiveCommand.writeAndRead(this);
+    if (!ftpResponse.isSuccessful) {
+      throw FtpException(
+          'Could not open transfer channel: ${ftpResponse.message}');
+    }
+    try {
+      return DataParserUtils.parsePort(ftpResponse, isIPV6: supportIPv6);
+    } catch (e) {
+      throw FtpException(
+          'Could not open transfer channel: ${ftpResponse.message}');
+    }
+  }
+
+  /// 主动模式开启本地连接
+  Future<HostServer> getActiveHostServer() async {
+    final port = transferMode.port ?? Random().nextInt(10000) + 10000;
+    final server =
+        await HostServer.bind(WebIONetworkAddress.anyIPv4.host, port);
+    _log?.call('Listening on ${server.address}:${server.port}');
+    final ftpResponse = await FtpCommand.PORT.writeAndRead(this, [
+      [
+        transferMode.host!.replaceAll('.', ','),
+        ((port >> 8) & 0xFF).toString(),
+        (port & 0xFF).toString()
+      ].join(',')
+    ]);
+    if (!ftpResponse.isSuccessful) {
+      throw FtpException('Could not open transfer channel');
+    }
+    return server;
+  }
+
   Future<T> openTransferChannel<T>(
     TransferChannelCallback doStuff, [
     TransferFailCallback? onFail,
+    FtpSocketCancelToken? cancelToken,
   ]) async {
     if (transferMode == FtpTransferMode.passive) {
-      final passiveCommand = supportIPv6 ? FtpCommand.EPSV : FtpCommand.PASV;
-      final ftpResponse = await passiveCommand.writeAndRead(this);
-      if (!ftpResponse.isSuccessful) {
-        throw FtpException('Could not open transfer channel');
+      final port = await getPassivePort();
+
+      final ClientSocket dataSocket = await ClientSocket.connect(_host, port,
+          timeout: const Duration(seconds: 3));
+      if (cancelToken != null) {
+        cancelToken.cancelFun = () async {
+          await dataSocket.close(ClientSocketDirection.readWrite);
+        };
       }
-      final port = DataParserUtils.parsePort(ftpResponse, isIPV6: supportIPv6);
-      final ClientSocket dataSocket =
-          await ClientSocket.connect(_host, port, timeout: _timeout);
       T result;
       try {
-        result = await doStuff(dataSocket, _log);
+        result = await doStuff(() => dataSocket, _log);
       } catch (e, s) {
         if (onFail != null) {
           await onFail(e, s);
@@ -233,34 +329,41 @@ class FtpSocket {
       return result;
     }
     //active mode
-    final server = await HostServer.bind(WebIONetworkAddress.anyIPv4.host,
-        transferMode.port ?? Random().nextInt(10000) + 10000);
-
-    _log?.call('Listening on ${server.address}:${server.port}');
-
-    final ftpResponse = await FtpCommand.PORT.writeAndRead(this, [
-      [
-        transferMode.host!.replaceAll('.', ','),
-        ((server.port >> 8) & 0xFF).toString(),
-        (server.port & 0xFF).toString()
-      ].join(',')
-    ]);
-    if (!ftpResponse.isSuccessful) {
-      await server.close();
-      throw FtpException('Could not open transfer channel');
+    final server = await getActiveHostServer();
+    ClientSocket? socket;
+    var isCanceled = false;
+    if (cancelToken != null) {
+      cancelToken.cancelFun = () async {
+        isCanceled = true;
+        await socket?.close(ClientSocketDirection.readWrite);
+      };
     }
-
     T result;
     try {
-      result = await doStuff(server.firstSocket.timeout(_timeout), _log);
+      FutureOr<ClientSocket> getSocket() async {
+        return server.firstSocket.then<ClientSocket>((value) {
+          socket = value;
+          return value;
+        }).timeout(_timeout);
+      }
+
+      result = await doStuff(getSocket, _log);
     } catch (e, s) {
       if (onFail != null) {
         await onFail(e, s);
       }
       rethrow;
     } finally {
+      // await FtpCommand.ABOR.writeAndRead(this);
       await server.close();
     }
+    try {
+      FtpCommand.ABOR.write(this);
+      await this.readAll();
+    } catch (e) {
+      _log?.call(e.toString());
+    }
+    // await FtpCommand.ABOR.writeAndRead(this);
     return result;
   }
 
@@ -338,4 +441,17 @@ class FtpSocketInitOptions {
     this.transferMode = FtpTransferMode.passive,
     this.transferType = FtpTransferType.auto,
   });
+}
+
+class FtpSocketCancelToken {
+  Future<void> Function()? cancelFun;
+
+  bool isCancel = false;
+
+  Future<void> cancel() async {
+    isCancel = true;
+    if (cancelFun != null) {
+      await cancelFun!();
+    }
+  }
 }

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:pure_ftp/src/extensions/ftp_directory_extensions.dart';
 import 'package:pure_ftp/src/file_system/ftp_entry.dart';
+import 'package:pure_ftp/src/file_system/ftp_entry_info.dart';
 import 'package:pure_ftp/src/ftp/exceptions/ftp_exception.dart';
 import 'package:pure_ftp/src/ftp/extensions/ftp_command_extension.dart';
 import 'package:pure_ftp/src/ftp/ftp_commands.dart';
@@ -13,6 +14,7 @@ class FtpFile extends FtpEntry {
   const FtpFile({
     required super.path,
     required super.client,
+    super.info,
   }) : _client = client;
 
   @override
@@ -37,6 +39,8 @@ class FtpFile extends FtpEntry {
       final uploadStream =
           secondClient.fs.uploadFileFromStream(fileTo, downloadFileStream);
       result = await uploadStream;
+    } catch (e) {
+      throw FtpException(e.toString());
     } finally {
       try {
         await secondClient.disconnect();
@@ -118,20 +122,21 @@ class FtpFile extends FtpEntry {
       throw FtpException('Parent directory of new file does not exist');
     }
     final response = await FtpCommand.RNFR.writeAndRead(_client.socket, [path]);
-    if (!response.isSuccessful) {
-      throw FtpException('Cannot rename file');
+    if (!response.isSuccessful && response.code != 350) {
+      throw FtpException('Cannot rename file ${path}');
     }
     final response2 =
         await FtpCommand.RNTO.writeAndRead(_client.socket, [newFile.path]);
     if (!response2.isSuccessful) {
-      throw FtpException('Cannot rename file');
+      throw FtpException('Cannot rename file ${newFile.path}');
     }
     return newFile;
   }
 
-  FtpFile copyWith(String path) {
+  FtpFile copyWith(String path, {FtpEntryInfo? info}) {
     return FtpFile(
       path: path,
+      info: info,
       client: _client,
     );
   }
